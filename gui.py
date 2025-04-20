@@ -1,340 +1,173 @@
-# app.py
-import streamlit as st
+#!/usr/bin/env python3
+# app.py - Main application file for Orange Tunisia News Scraper
+
 import os
+import sys
 import json
+import argparse
 from datetime import datetime
 import time
-import threading
+from typing import List, Dict, Any
+import concurrent.futures
+import logging
+from pathlib import Path
 import markdown
-import base64
+
 from news_scraper import NewsScraperAndGenerator
 import config
 
-# Set page configuration
-st.set_page_config(
-    page_title="Orange Tunisia News Scraper",
-    page_icon="📰",
-    layout="wide"
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('orange_news_scraper.log')
+    ]
 )
+logger = logging.getLogger('orange_news_scraper')
 
-# Define Orange theme colors
-ORANGE_THEME = config.ORANGE_THEME
-
-# Apply custom CSS
-st.markdown(f"""
-    <style>
-        .stApp {{
-            background-color: {ORANGE_THEME['light']};
-            color: {ORANGE_THEME['dark']};
-        }}
-        h1, h2, h3, h4 {{
-            color: {ORANGE_THEME['primary']};
-        }}
-        .stButton>button {{
-            background-color: {ORANGE_THEME['primary']};
-            color: {ORANGE_THEME['light']};
-            border: none;
-            border-radius: 5px;
-            padding: 8px 15px;
-            font-weight: bold;
-        }}
-        .stButton>button:hover {{
-            background-color: {ORANGE_THEME['secondary']};
-        }}
-        .stTextInput>div>div>input {{
-            border: 1px solid {ORANGE_THEME['grey']};
-            border-radius: 4px;
-            padding: 5px;
-        }}
-        .stSelectbox>div>div>div {{
-            border: 1px solid {ORANGE_THEME['grey']};
-            border-radius: 4px;
-        }}
-        .article-preview {{
-            border: 1px solid {ORANGE_THEME['grey']};
-            border-radius: 5px;
-            padding: 10px;
-            background-color: white;
-        }}
-        .html-preview {{
-            border: 1px solid {ORANGE_THEME['grey']};
-            border-radius: 5px;
-            padding: 10px;
-            background-color: white;
-        }}
-    </style>
-""", unsafe_allow_html=True)
-
-# Initialize session state
-if 'scraped_data' not in st.session_state:
-    st.session_state.scraped_data = []
-if 'current_article' not in st.session_state:
-    st.session_state.current_article = ""
-if 'scraping_status' not in st.session_state:
-    st.session_state.scraping_status = "Ready to scrape..."
-if 'generation_status' not in st.session_state:
-    st.session_state.generation_status = "Ready to generate..."
-
-# Header
-st.markdown(f"<h1 style='color: {ORANGE_THEME['primary']}; text-align: center;'>ORANGE NEWS TUNISIA</h1>", unsafe_allow_html=True)
-
-# Create tabs
-tab1, tab2, tab3 = st.tabs(["Scrape News", "Generate Article", "Results"])
-
-with tab1:
-    st.header("News Sources")
+class OrangeNewsScraper:
+    """Main application class for Orange Tunisia News Scraper"""
     
-    # Topic selection
-    topic_options = ["all"] + list(config.NEWS_SOURCES.keys())
-    topic_labels = ["All"] + [topic.replace("_", " ").title() for topic in config.NEWS_SOURCES.keys()]
-    topic_dict = dict(zip(topic_labels, topic_options))
-    
-    selected_topic_label = st.selectbox("Topic:", topic_labels)
-    selected_topic = topic_dict[selected_topic_label]
-    
-    # Custom URL
-    custom_url = st.text_input("Custom URL:", placeholder="Enter custom URL")
-    col1, col2 = st.columns([1, 5])
-    with col1:
-        if st.button("Add URL"):
-            if custom_url:
-                if 'url_list' not in st.session_state:
-                    st.session_state.url_list = []
-                if custom_url not in st.session_state.url_list:
-                    st.session_state.url_list.append(custom_url)
-    with col2:
-        if st.button("Clear URLs"):
-            st.session_state.url_list = []
-    
-    # URL list
-    st.subheader("Selected URLs:")
-    
-    # Get URLs from selected topic
-    if selected_topic == "all":
-        topic_urls = []
-        for topic_urls_list in config.NEWS_SOURCES.values():
-            topic_urls.extend(topic_urls_list)
-    else:
-        topic_urls = config.NEWS_SOURCES.get(selected_topic, [])
-    
-    # Combine with custom URLs if any
-    if 'url_list' in st.session_state:
-        all_urls = topic_urls + st.session_state.url_list
-    else:
-        all_urls = topic_urls
-    
-    # Display URL list
-    st.text_area("", value="\n".join(all_urls), height=150, key="urls_display")
-    
-    # Filtering
-    st.header("Filtering")
-    keyword = st.text_input("Search Keyword:", placeholder="Enter keyword to filter articles")
-    
-    # Actions
-    st.header("Actions")
-    if st.button("Start Scraping", use_container_width=True):
-        urls = all_urls
+    def __init__(self, api_key: str = None):
+        """Initialize the application with API key from environment or argument"""
+        self.api_key = api_key or os.getenv('OPENAI_API_KEY')
         
-        if not urls:
-            st.error("Please select a topic or add custom URLs")
+        if not self.api_key:
+            logger.error("No OpenAI API key provided. Please set OPENAI_API_KEY environment variable or pass as argument.")
+            sys.exit(1)
+        
+        self.model_name = config.OPENAI_MODEL
+        self.scraper = None
+        
+    def initialize_scraper(self):
+        """Initialize the scraper only when needed"""
+        if self.scraper is None:
+            self.scraper = NewsScraperAndGenerator(self.api_key, self.model_name)
+            # We're not using the persistent cache as it's causing issues
+            # Just rely on the built-in in-memory cache
+        return self.scraper
+    
+    def shutdown(self):
+        """Properly close resources"""
+        if self.scraper:
+            self.scraper.close()
+            self.scraper = None
+    
+    def get_sources_by_topic(self, topic: str) -> List[str]:
+        """Get list of sources by topic"""
+        if topic == 'all':
+            # Combine all sources
+            all_sources = []
+            for sources in config.NEWS_SOURCES.values():
+                all_sources.extend(sources)
+            return all_sources
         else:
-            openai_api_key = st.session_state.get('openai_api_key', os.getenv("OPENAI_API_KEY", ""))
-            if not openai_api_key:
-                st.error("Please enter your OpenAI API Key in the sidebar")
-            else:
-                # Set status
-                st.session_state.scraping_status = "Initializing scraper..."
+            return config.NEWS_SOURCES.get(topic, [])
+    
+    def scrape_news(self, 
+                   topic: str = 'all', 
+                   sources: List[str] = None, 
+                   search_keyword: str = None,
+                   max_workers: int = 5,
+                   verbose: bool = False) -> List[Dict[str, Any]]:
+        """Scrape news from specified sources"""
+        # Initialize scraper
+        scraper = self.initialize_scraper()
+        
+        # Determine sources
+        if sources:
+            urls_to_scrape = sources
+        else:
+            urls_to_scrape = self.get_sources_by_topic(topic)
+        
+        if not urls_to_scrape:
+            logger.warning("No sources to scrape")
+            return []
+        
+        logger.info(f"Starting to scrape {len(urls_to_scrape)} sources with {max_workers} workers")
+        
+        # Perform scraping
+        results = scraper.scrape_multiple_sources(urls_to_scrape, max_workers=max_workers)
+        
+        # Apply keyword filtering if specified
+        if search_keyword:
+            filtered_results = []
+            for article in results:
+                if 'error' in article:
+                    continue
                 
-                # Create a placeholder for progress
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                status_text.text(st.session_state.scraping_status)
+                title = article.get('title', '').lower()
+                content = article.get('content', '').lower()
                 
-                try:
-                    # Initialize scraper
-                    scraper_generator = NewsScraperAndGenerator(openai_api_key, config.OPENAI_MODEL)
-                    
-                    results = []
-                    total_urls = len(urls)
-                    
-                    # Scrape each URL
-                    for i, url in enumerate(urls):
-                        status = f"Scraping {url}..."
-                        status_text.text(status)
-                        st.session_state.scraping_status = status
-                        
-                        article_data = scraper_generator.scrape_article(url)
-                        results.append(article_data)
-                        
-                        # Update progress
-                        progress = int((i + 1) / total_urls * 100)
-                        progress_bar.progress(progress / 100)
-                    
-                    # Handle filtering
-                    if keyword:
-                        filtered_data = []
-                        for article in results:
-                            if 'error' in article:
-                                continue
-                            
-                            title = article.get('title', '').lower()
-                            content = article.get('content', '').lower()
-                            
-                            if keyword.lower() in title or keyword.lower() in content:
-                                filtered_data.append(article)
-                        
-                        results = filtered_data
-                        status = f"Scraped and filtered {len(results)} articles containing '{keyword}'"
-                    else:
-                        valid_articles = [a for a in results if 'error' not in a]
-                        status = f"Scraped {len(valid_articles)} articles successfully"
-                    
-                    # Update status
-                    status_text.text(status)
-                    st.session_state.scraping_status = status
-                    
-                    # Store results
-                    st.session_state.scraped_data = results
-                    
-                    # Close scraper
-                    scraper_generator.close()
-                    
-                    # Switch to generator tab if we have data
-                    if len(results) > 0:
-                        st.success(f"Successfully scraped {len(results)} articles. You can now generate an article.")
-                    else:
-                        st.warning("No articles found with the current settings.")
-                
-                except Exception as e:
-                    error_message = f"Error: {str(e)}"
-                    status_text.text(error_message)
-                    st.session_state.scraping_status = error_message
-                    st.error(error_message)
-    
-    # Progress section
-    st.header("Progress")
-    st.text(st.session_state.scraping_status)
-
-with tab2:
-    st.header("Article Settings")
-    
-    # Template selection
-    template_options = list(config.ARTICLE_TEMPLATES.keys())
-    template_labels = [template.replace("_", " ").title() for template in template_options]
-    template_dict = dict(zip(template_labels, template_options))
-    
-    selected_template_label = st.selectbox("Template:", template_labels)
-    selected_template = template_dict[selected_template_label]
-    
-    # Get template info
-    template = config.ARTICLE_TEMPLATES.get(selected_template, {})
-    
-    # Form for article settings
-    with st.form(key="article_settings"):
-        custom_topic = st.text_input("Custom Topic:", value=template.get("topic", ""))
-        audience = st.text_input("Audience:", value=template.get("audience", ""))
-        tone = st.text_input("Tone:", value=template.get("tone", ""))
-        max_length = st.number_input("Max Length (words):", value=template.get("max_length", 800), min_value=100, max_value=5000)
+                if search_keyword.lower() in title or search_keyword.lower() in content:
+                    filtered_results.append(article)
+            
+            logger.info(f"Filtered {len(results)} articles down to {len(filtered_results)} containing '{search_keyword}'")
+            results = filtered_results
         
-        # Generate button
-        generate_submitted = st.form_submit_button(label="Generate Article", use_container_width=True)
+        # Save raw data if verbose
+        if verbose:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output_file = f"scraped_data_{timestamp}.json"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            logger.info(f"Raw scraped data saved to {output_file}")
         
-        if generate_submitted:
-            if not st.session_state.scraped_data:
-                st.error("Please scrape some news sources first")
-            else:
-                openai_api_key = st.session_state.get('openai_api_key', os.getenv("OPENAI_API_KEY", ""))
-                if not openai_api_key:
-                    st.error("Please enter your OpenAI API Key in the sidebar")
-                else:
-                    # Set status
-                    st.session_state.generation_status = "Initializing article generator..."
-                    
-                    # Create placeholders for progress
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    status_text.text(st.session_state.generation_status)
-                    
-                    try:
-                        # Initialize generator
-                        scraper_generator = NewsScraperAndGenerator(openai_api_key, config.OPENAI_MODEL)
-                        
-                        # Update status
-                        status = "Generating article from scraped data..."
-                        status_text.text(status)
-                        st.session_state.generation_status = status
-                        progress_bar.progress(30 / 100)
-                        
-                        # Generate article
-                        article = scraper_generator.generate_article_for_orange(
-                            st.session_state.scraped_data,
-                            topic=custom_topic,
-                            audience=audience,
-                            tone=tone,
-                            max_length=max_length
-                        )
-                        
-                        # Update progress
-                        progress_bar.progress(90 / 100)
-                        
-                        # Close generator
-                        scraper_generator.close()
-                        
-                        # Update status
-                        status = "Article generation completed!"
-                        status_text.text(status)
-                        st.session_state.generation_status = status
-                        progress_bar.progress(100 / 100)
-                        
-                        # Store article
-                        st.session_state.current_article = article
-                        
-                        # Success message
-                        st.success("Article generated successfully! You can now view and save it in the Results tab.")
-                        
-                    except Exception as e:
-                        error_message = f"Error: {str(e)}"
-                        status_text.text(error_message)
-                        st.session_state.generation_status = error_message
-                        st.error(error_message)
+        return results
     
-    # Progress section
-    st.header("Progress")
-    st.text(st.session_state.generation_status)
-
-with tab3:
-    st.header("Article Preview")
-    
-    # Display article if available
-    if st.session_state.current_article:
-        # Text preview
-        st.subheader("Markdown")
-        st.markdown('<div class="article-preview">', unsafe_allow_html=True)
-        st.text_area("", value=st.session_state.current_article, height=300, key="article_text")
-        st.markdown('</div>', unsafe_allow_html=True)
+    def generate_article(self,
+                       scraped_data: List[Dict[str, Any]],
+                       template: str = 'telecom_news',
+                       custom_topic: str = None,
+                       audience: str = None,
+                       tone: str = None,
+                       max_length: int = None,
+                       include_images: bool = True,
+                       output_dir: str = 'output') -> Dict[str, Any]:
+        """Generate article from scraped data"""
+        # Initialize scraper
+        scraper = self.initialize_scraper()
         
-        # HTML preview
-        st.subheader("HTML Preview")
-        st.markdown('<div class="html-preview">', unsafe_allow_html=True)
-        html_content = markdown.markdown(st.session_state.current_article)
-        st.markdown(html_content, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        # Get template settings
+        template_config = config.ARTICLE_TEMPLATES.get(template, {})
         
-        # Save button
-        current_date = datetime.now().strftime("%Y%m%d-%H%M%S")
-        template_name = selected_template
-        file_name = f"orange_tunisia_article_{template_name}_{current_date}.md"
+        # Use custom values or fall back to template defaults
+        topic = custom_topic or template_config.get('topic', '')
+        audience = audience or template_config.get('audience', 'general')
+        tone = tone or template_config.get('tone', 'professional')
+        max_length = max_length or template_config.get('max_length', 800)
         
-        # Create a download button
-        st.download_button(
-            label="Download Article as Markdown",
-            data=st.session_state.current_article,
-            file_name=file_name,
-            mime="text/markdown",
-            key="download_button"
+        logger.info(f"Generating article with template: {template}, topic: {topic}")
+        
+        # Generate article
+        result = scraper.generate_article_for_orange(
+            scraped_data,
+            topic=topic,
+            audience=audience,
+            tone=tone,
+            max_length=max_length,
+            include_images=include_images
         )
         
-        # Create HTML download option
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Save article to markdown file
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        md_filename = f"{output_dir}/orange_tunisia_article_{template}_{timestamp}.md"
+        
+        with open(md_filename, 'w', encoding='utf-8') as f:
+            f.write(result['content'])
+        
+        logger.info(f"Article saved to {md_filename}")
+        
+        # Save HTML version
+        html_content = markdown.markdown(result['content'])
+        html_filename = f"{output_dir}/orange_tunisia_article_{template}_{timestamp}.html"
+        
         styled_html = f"""
         <!DOCTYPE html>
         <html>
@@ -349,31 +182,31 @@ with tab3:
                     color: #333;
                 }}
                 h1 {{
-                    color: {ORANGE_THEME['primary']};
+                    color: {config.ORANGE_THEME['primary']};
                 }}
                 h2, h3, h4 {{
-                    color: {ORANGE_THEME['secondary']};
+                    color: {config.ORANGE_THEME['secondary']};
                 }}
                 a {{
-                    color: {ORANGE_THEME['primary']};
+                    color: {config.ORANGE_THEME['primary']};
                 }}
                 blockquote {{
-                    border-left: 4px solid {ORANGE_THEME['primary']};
+                    border-left: 4px solid {config.ORANGE_THEME['primary']};
                     padding-left: 15px;
                     margin-left: 0;
-                    color: {ORANGE_THEME['grey']};
+                    color: {config.ORANGE_THEME['grey']};
                 }}
                 img {{
                     max-width: 100%;
                 }}
                 pre {{
-                    background-color: {ORANGE_THEME['light_grey']};
+                    background-color: {config.ORANGE_THEME['light_grey']};
                     padding: 10px;
                     border-radius: 5px;
                     overflow-x: auto;
                 }}
                 code {{
-                    background-color: {ORANGE_THEME['light_grey']};
+                    background-color: {config.ORANGE_THEME['light_grey']};
                     padding: 2px 4px;
                     border-radius: 3px;
                 }}
@@ -385,46 +218,96 @@ with tab3:
         </html>
         """
         
-        html_file_name = f"orange_tunisia_article_{template_name}_{current_date}.html"
+        with open(html_filename, 'w', encoding='utf-8') as f:
+            f.write(styled_html)
         
-        st.download_button(
-            label="Download Article as HTML",
-            data=styled_html,
-            file_name=html_file_name,
-            mime="text/html",
-            key="download_html_button"
-        )
-    else:
-        st.info("No article generated yet. Please go to the 'Generate Article' tab to create an article.")
+        logger.info(f"HTML version saved to {html_filename}")
+        
+        # Save analytics data
+        analytics_data = {
+            "article_info": {
+                "title": template,
+                "date": timestamp,
+                "topic": topic,
+                "audience": audience,
+                "tone": tone,
+                "word_count": len(result['content'].split())
+            },
+            "sentiment": result.get("sentiment_analysis", {}),
+            "keywords": result.get("keywords", []),
+            "images": [img.get("url") for img in result.get("images", [])]
+        }
+        
+        analytics_filename = f"{output_dir}/orange_tunisia_analytics_{template}_{timestamp}.json"
+        
+        with open(analytics_filename, 'w', encoding='utf-8') as f:
+            json.dump(analytics_data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Analytics data saved to {analytics_filename}")
+        
+        return result
 
-# Sidebar
-with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/c/c8/Orange_logo.svg", width=100)
-    st.title("Settings")
+def main():
+    """Main function for command-line execution"""
+    parser = argparse.ArgumentParser(description="Orange Tunisia News Scraper and Article Generator")
     
-    # API Key input
-    openai_api_key = st.text_input(
-        "OpenAI API Key",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        type="password",
-        help="Enter your OpenAI API key here"
-    )
+    # Main options
+    parser.add_argument('--topic', '-t', choices=['all', 'technology', 'business', 'telecom', 'general'], 
+                        default='all', help='Topic category to focus on')
+    parser.add_argument('--template', '-m', choices=list(config.ARTICLE_TEMPLATES.keys()),
+                        default='telecom_news', help='Article template to use')
+    parser.add_argument('--sources', '-s', nargs='+', help='Specific URLs to scrape (overrides topic selection)')
+    parser.add_argument('--output', '-o', default='output', help='Directory to save output files')
+    parser.add_argument('--custom-topic', '-c', help='Custom topic to focus on (overrides template topic)')
+    parser.add_argument('--search', '-q', help='Keyword to search for in article content')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
     
-    if openai_api_key:
-        st.session_state.openai_api_key = openai_api_key
+    # Advanced options
+    parser.add_argument('--api-key', help='OpenAI API Key (overrides environment variable)')
+    parser.add_argument('--workers', '-w', type=int, default=5, help='Number of parallel workers for scraping')
+    parser.add_argument('--audience', help='Target audience (overrides template default)')
+    parser.add_argument('--tone', help='Article tone (overrides template default)')
+    parser.add_argument('--max-length', type=int, help='Maximum article length in words (overrides template default)')
+    parser.add_argument('--no-images', action='store_true', help='Disable image inclusion in articles')
     
-    st.divider()
+    args = parser.parse_args()
     
-    # App information
-    st.subheader("About")
-    st.write("Orange Tunisia News Scraper v1.0")
-    st.write("This app scrapes news from various sources and generates articles using OpenAI's LLM.")
+    # Initialize application
+    app = OrangeNewsScraper(api_key=args.api_key)
     
-    st.divider()
-    
-    # Instructions
-    st.subheader("How to use")
-    st.write("1. Select news sources or add custom URLs")
-    st.write("2. Click 'Start Scraping' to collect news data")
-    st.write("3. Configure article settings and generate")
-    st.write("4. View and download your article")
+    try:
+        # Step 1: Scrape news sources
+        scraped_data = app.scrape_news(
+            topic=args.topic,
+            sources=args.sources,
+            search_keyword=args.search,
+            max_workers=args.workers,
+            verbose=args.verbose
+        )
+        
+        if not scraped_data:
+            logger.warning("No valid articles found to generate content")
+            return
+        
+        # Step 2: Generate article
+        app.generate_article(
+            scraped_data,
+            template=args.template,
+            custom_topic=args.custom_topic,
+            audience=args.audience,
+            tone=args.tone,
+            max_length=args.max_length,
+            include_images=not args.no_images,
+            output_dir=args.output
+        )
+        
+    except KeyboardInterrupt:
+        logger.info("Operation canceled by user")
+    except Exception as e:
+        logger.exception(f"Error during execution: {e}")
+    finally:
+        # Clean up resources
+        app.shutdown()
+
+if __name__ == "__main__":
+    main()

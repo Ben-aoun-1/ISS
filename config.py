@@ -64,3 +64,28 @@ ARTICLE_TEMPLATES = {
         'max_length': 700
     }
 }
+
+# Analytics configuration
+ANALYTICS_CONFIG = {
+    'sentiment_analysis': True,
+    'keyword_extraction': True,
+    'image_extraction': True,
+    'max_keywords': 15,
+    'min_keyword_relevance': 0.3
+}
+
+# Image processing configuration
+IMAGE_CONFIG = {
+    'min_width': 300,          # Minimum image width to include
+    'min_height': 200,         # Minimum image height to include
+    'preferred_formats': ['jpg', 'jpeg', 'png', 'webp'],
+    'max_images_per_article': 5,
+    'include_captions': True
+}
+
+# Caching configuration
+CACHE_CONFIG = {
+    'enabled': True,
+    'ttl_seconds': 3600,  # Time-to-live: 1 hour
+    'max_entries': 1000,  # Maximum cache entries
+}
